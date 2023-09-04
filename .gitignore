@@ -1,3 +1,4 @@
 .vscode/
 Total*
 preprocessed1/
+__pycache__/
