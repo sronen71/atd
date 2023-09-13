@@ -2,3 +2,10 @@
 Total*
 preprocessed1/
 __pycache__/
+bowel/
+features/
+preprocessed2/
+models_bowel/
+models_cls/
+models_seg/
+logs/
