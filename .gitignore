@@ -1,11 +1,9 @@
 .vscode/
 Total*
-preprocessed1/
+preprocessed*/
 __pycache__/
 bowel/
-features/
-preprocessed2/
-models_bowel/
-models_cls/
-models_seg/
+features*/
+models_*/
 logs/
+
