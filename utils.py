@@ -4,7 +4,6 @@ import numpy as np
 import dicomsdl
 import cv2
 import glob
-from monai.transforms import Resize
 from torch import nn
 import timm
 import segmentation_models_pytorch as smp
@@ -14,6 +13,9 @@ from conv3d_same import Conv3dSame
 import threading
 from matplotlib.colors import ListedColormap
 from matplotlib import pyplot as plt
+import torch.nn.functional as F
+import pandas as pd
+import sklearn
 
 
 preprocessed1_dir = "preprocessed1"
@@ -27,7 +29,8 @@ def load_dicom_2d(path, resize=None):  # image_seg_size
         dtype = data.dtype
         data = (data << bit_shift).astype(dtype) >> bit_shift
 
-    data = data * dicom.RescaleSlope + dicom.RescaleIntercept
+    # data = data * dicom.RescaleSlope + dicom.RescaleIntercept
+    data = data.astype(np.float64) * dicom.RescaleSlope + dicom.RescaleIntercept
 
     if resize:
         data = cv2.resize(data, (resize[0], resize[1]), interpolation=cv2.INTER_LINEAR)
@@ -67,8 +70,9 @@ def stack_images(images, orient, positions):
     imaging_axis = np.cross(orient[:3], orient[3:])
     distance_projection = np.dot(np.stack(positions), imaging_axis)
     images = np.stack(images, -1)
+    sorted_slices = np.arange(0, images.shape[2])[np.argsort(distance_projection)]
     images = images[:, :, np.argsort(distance_projection)]
-    return images
+    return images, sorted_slices
 
 
 def load_dicom_3d(paths, resize_2d=None):
@@ -79,9 +83,9 @@ def load_dicom_3d(paths, resize_2d=None):
         images.append(img)
         positions.append(pos)
 
-    images = stack_images(images, orient, positions)
+    images, sorted_slices = stack_images(images, orient, positions)
     images = window_images(images)
-    return images
+    return images, sorted_slices
 
 
 def load_dicom_folder(folder, num, resize_2d=None):
@@ -89,6 +93,10 @@ def load_dicom_folder(folder, num, resize_2d=None):
         glob.glob(os.path.join(folder, "*")), key=lambda x: int(x.split("/")[-1].split(".")[0])
     )
     # print(t_paths, folder)
+    for filename in t_paths:
+        if "test_images/3124/5842/514.dcm" in filename:  # corrupt slice
+            t_paths.remove(filename)
+
     n_scans = len(t_paths)
     if num is not None:
         indices = np.quantile(list(range(n_scans)), np.linspace(0.0, 1.0, num)).round().astype(int)
@@ -96,12 +104,9 @@ def load_dicom_folder(folder, num, resize_2d=None):
     return load_dicom_3d(t_paths, resize_2d=resize_2d)
 
 
-def resize3d(full3d, resize):
-    indices = (
-        np.quantile(list(range(full3d.shape[2])), np.linspace(0.0, 1.0, resize[2]))
-        .round()
-        .astype(int)
-    )
+def resize3d(full3d, sorted_slices, resize):
+    slices = list(range(full3d.shape[2]))
+    indices = np.quantile(slices, np.linspace(0.0, 1.0, resize[2])).round().astype(int)
     image3d = full3d[:, :, indices]
     images = []
     for i in range(image3d.shape[2]):
@@ -289,7 +294,12 @@ def load_organ(image_full, mask, cid, cropped_images):
             image = cv2.resize(
                 image, (image_size_cls, image_size_cls), interpolation=cv2.INTER_LINEAR
             )
-            mask_this = (mask_this * 32).astype(np.uint8)
+            if cid < 4:
+                mask_this = mask_this * 255
+            else:
+                mask_this = mask_this * 32
+
+            mask_this = mask_this.astype(np.uint8)
             mask_this = cv2.resize(
                 mask_this, (image_size_cls, image_size_cls), interpolation=cv2.INTER_NEAREST
             )
@@ -510,3 +520,179 @@ class BowelModel(nn.Module):
             return feat
         else:
             return out, out2
+
+
+class PENet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.hu_weight = nn.Sequential(
+            nn.Linear(2, 16), nn.ReLU(), nn.Linear(16, 1), nn.Sigmoid()
+        )  # extravasation weighting by hu
+        self.inj_bias = nn.Parameter(torch.zeros(8))
+
+    def forward(self, x):  # N,series,logits
+        hu = x["bowel"][:, :, 2]
+        bowel = x["bowel"][:, :, 0]
+        extravasation = x["bowel"][:, :, 1]
+        liver = x["liver"][:, :, :-1]
+        spleen = x["spleen"][:, :, :-1]
+        kidney = x["kidney"][:, :, :-1]
+        hu_weight = self.hu_weight(hu).squeeze()  # N
+
+        choose = 0  # lower hu -> portal venous phase seems more reliable
+        if choose == "mean":
+            extravasation = extravasation * torch.stack((hu_weight, 1 - hu_weight), dim=1)
+            extravasation = extravasation.sum(dim=1)
+            bowel = bowel.mean(dim=1)
+            liver = liver.mean(dim=1)
+            spleen = spleen.mean(dim=1)
+            kidney = kidney.mean(dim=1)
+
+        elif choose == "max":
+            extravasation = extravasation.max(dim=1)[0]
+            bowel = bowel.max(dim=1)[0]
+            liver = liver.max(dim=1)[0]
+            spleen = spleen.max(dim=1)[0]
+            kidney = kidney.max(dim=1)[0]
+
+        else:
+            extravasation = extravasation[
+                :, 1
+            ]  # extravsation maybe slightly better from late arterial phase (higher hu)
+            bowel = bowel[:, choose]
+            liver = liver[:, choose, :]
+            spleen = spleen[:, choose, :]
+            kidney = kidney[:, choose, :]
+
+        inj_bias = self.inj_bias
+
+        bowel = bowel + inj_bias[0]
+        extravasation = extravasation + inj_bias[1]
+        liver = liver + F.pad(inj_bias[2:4], (1, 0))
+        spleen = spleen + F.pad(inj_bias[4:6], (1, 0))
+        kidney = kidney + F.pad(inj_bias[6:8], (1, 0))
+
+        logits = {
+            "liver": liver,
+            "spleen": spleen,
+            "kidney": kidney,
+            "bowel": bowel,
+            "extravasation": extravasation,
+        }
+        return logits
+
+
+class ParticipantVisibleError(Exception):
+    pass
+
+
+def normalize_probabilities_to_one(df: pd.DataFrame, group_columns: list) -> pd.DataFrame:
+    # Normalize the sum of each row's probabilities to 100%.
+    # 0.75, 0.75 => 0.5, 0.5
+    # 0.1, 0.1 => 0.5, 0.5
+    row_totals = df[group_columns].sum(axis=1)
+    if row_totals.min() == 0:
+        raise ParticipantVisibleError("All rows must contain at least one non-zero prediction")
+    for col in group_columns:
+        df[col] /= row_totals
+    return df
+
+
+def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: str) -> float:
+    """
+    Pseudocode:
+    1. For every label group (liver, bowel, etc):
+        - Normalize the sum of each row's probabilities to 100%.
+        - Calculate the sample weighted log loss.
+    2. Derive a new any_injury label by taking the max of 1 - p(healthy) for each label group
+    3. Calculate the sample weighted log loss for the new label group
+    4. Return the average of all of the label group log losses as the final score.
+    """
+    del solution[row_id_column_name]
+    del submission[row_id_column_name]
+    # Run basic QC checks on the inputs
+    if not pd.api.types.is_numeric_dtype(submission.values):
+        raise ParticipantVisibleError("All submission values must be numeric")
+
+    if not np.isfinite(submission.values).all():
+        raise ParticipantVisibleError("All submission values must be finite")
+
+    if solution.min().min() < 0:
+        raise ParticipantVisibleError("All labels must be at least zero")
+    if submission.min().min() < 0:
+        raise ParticipantVisibleError("All predictions must be at least zero")
+
+    # Calculate the label group log losses
+    binary_targets = ["bowel", "extravasation"]
+    triple_level_targets = ["kidney", "liver", "spleen"]
+    all_target_categories = binary_targets + triple_level_targets
+
+    label_group_losses = []
+    for category in all_target_categories:
+        if category in binary_targets:
+            col_group = [f"{category}_healthy", f"{category}_injury"]
+        else:
+            col_group = [f"{category}_healthy", f"{category}_low", f"{category}_high"]
+
+        solution = normalize_probabilities_to_one(solution, col_group)
+
+        for col in col_group:
+            if col not in submission.columns:
+                raise ParticipantVisibleError(f"Missing submission column {col}")
+        submission = normalize_probabilities_to_one(submission, col_group)
+        label_group_losses.append(
+            sklearn.metrics.log_loss(
+                y_true=solution[col_group].values,
+                y_pred=submission[col_group].values,
+                sample_weight=solution[f"{category}_weight"].values,
+            )
+        )
+
+    # Derive a new any_injury label by taking the max of 1 - p(healthy) for each label group
+    healthy_cols = [x + "_healthy" for x in all_target_categories]
+    any_injury_labels = (1 - solution[healthy_cols]).max(axis=1)
+    any_injury_predictions = (1 - submission[healthy_cols]).max(axis=1)
+    any_injury_loss = sklearn.metrics.log_loss(
+        y_true=any_injury_labels.values,
+        y_pred=any_injury_predictions.values,
+        sample_weight=solution["any_injury_weight"].values,
+    )
+
+    label_group_losses.append(any_injury_loss)
+    all_target_categories.append("any_injury")
+
+    group_losses = {
+        all_target_categories[i]: label_group_losses[i] for i in range(len(all_target_categories))
+    }
+    return np.mean(label_group_losses), group_losses
+
+
+# Assign the appropriate weights to each category
+def create_training_solution(y_train):
+    sol_train = y_train.copy()
+
+    # bowel healthy|injury sample weight = 1|2
+    sol_train["bowel_weight"] = np.where(sol_train["bowel_injury"] == 1, 2, 1)
+
+    # extravasation healthy/injury sample weight = 1|6
+    sol_train["extravasation_weight"] = np.where(sol_train["extravasation_injury"] == 1, 6, 1)
+
+    # kidney healthy|low|high sample weight = 1|2|4
+    sol_train["kidney_weight"] = np.where(
+        sol_train["kidney_low"] == 1, 2, np.where(sol_train["kidney_high"] == 1, 4, 1)
+    )
+
+    # liver healthy|low|high sample weight = 1|2|4
+    sol_train["liver_weight"] = np.where(
+        sol_train["liver_low"] == 1, 2, np.where(sol_train["liver_high"] == 1, 4, 1)
+    )
+
+    # spleen healthy|low|high sample weight = 1|2|4
+    sol_train["spleen_weight"] = np.where(
+        sol_train["spleen_low"] == 1, 2, np.where(sol_train["spleen_high"] == 1, 4, 1)
+    )
+
+    # any healthy|injury sample weight = 1|6
+    sol_train["any_injury_weight"] = np.where(sol_train["any_injury"] == 1, 6, 1)
+    return sol_train
